@@ -20,3 +20,6 @@ AGENTS.md
 
 # Session aids (orientation snapshots)
 *-orientation.md
+
+# Bundled FFmpeg binaries (local only)
+ffmpeg/
