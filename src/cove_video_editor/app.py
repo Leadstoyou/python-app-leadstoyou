@@ -102,6 +102,7 @@ from .clip_bin import ASSET_MIME, ClipBin
 from .crop_overlay import CropOverlay
 from .downloader import DownloadVideoDialog
 from .exporter import AudioTrack, ExportJob, start_export
+from .transcribe import SUBTITLE_LANG_FORMATS, start_transcribe
 from .thumbnails import start_thumbnails, start_waveform
 from .timeline_widget import TimelineWidget
 
@@ -125,15 +126,21 @@ def export_controls_enabled(
     has_added_audio: bool,
     audio_only: bool,
     exporting: bool,
+    *,
+    subtitles_only: bool = False,
+    has_subtitles: bool = False,
 ) -> bool:
     """Whether the Export button / format combo should be enabled.
 
     Project export needs at least one video clip; Audio Only export also
-    accepts a timeline with only AddedAudio items. Always disabled while
-    an export is running.
+    accepts a timeline with only AddedAudio items; Subtitles export
+    generates an SRT from timeline speech and therefore also needs clips.
+    Always disabled while an export is running.
     """
     if exporting:
         return False
+    if subtitles_only:
+        return has_clips
     if audio_only:
         return has_clips or has_added_audio
     return has_clips
@@ -879,7 +886,10 @@ class MainWindow(QMainWindow):
         self.delete_clip_btn = QPushButton("Delete clip")
         self.delete_clip_btn.clicked.connect(self._delete_selected_clip)
         self.download_video_btn = QPushButton("Download Video")
-        self.download_video_btn.setToolTip("Download a video from a URL and add it at the playhead")
+        self.download_video_btn.setToolTip(
+            "Download a video from a URL (optional Chinese / English / Vietnamese SRT) "
+            "and add it at the playhead",
+        )
         self.download_video_btn.clicked.connect(self._on_download_video_clicked)
         self.crop_btn = QPushButton("Crop")
         self.crop_btn.setCheckable(True)
@@ -979,12 +989,13 @@ class MainWindow(QMainWindow):
         self.export_type_combo = QComboBox()
         self.export_type_combo.addItem("Project")
         self.export_type_combo.addItem("Audio Only")
+        self.export_type_combo.addItem("Subtitles")
         self.export_type_combo.setCurrentText("Project")
         self.export_type_combo.currentTextChanged.connect(self._on_export_type_changed)
 
         self.format_combo = QComboBox()
         self.format_combo.setMinimumWidth(220)
-        self._populate_format_combo(False)
+        self._populate_format_combo("project")
 
         export_lbl = QLabel("EXPORT")
         export_lbl.setObjectName("ExportLabel")
@@ -1130,7 +1141,7 @@ class MainWindow(QMainWindow):
         dlg.raise_()
         dlg.activateWindow()
 
-    def _on_download_video_finished(self, path: Path) -> None:
+    def _on_download_video_finished(self, path: Path, srt_paths: list | None = None) -> None:
         insert_t = self.timeline.playhead()
         existing = next((a for a in self._assets.values() if a.path == path), None)
         if existing is None:
@@ -1144,7 +1155,23 @@ class MainWindow(QMainWindow):
             )
             return
         self._insert_clip_at(existing.id, insert_t)
-        self.status.showMessage(f"Downloaded and added {path.name}.", 6000)
+
+        imported_subs = 0
+        for srt in srt_paths or []:
+            srt_path = Path(srt)
+            if srt_path.is_file() and srt_path.suffix.lower() == ".srt":
+                before = len(self._subs)
+                self._import_sub(srt_path)
+                if len(self._subs) > before or any(s.path == srt_path for s in self._subs):
+                    imported_subs += 1
+
+        if imported_subs:
+            self.status.showMessage(
+                f"Downloaded and added {path.name} + {imported_subs} SRT subtitle(s).",
+                8000,
+            )
+        else:
+            self.status.showMessage(f"Downloaded and added {path.name}.", 6000)
 
     # --- importing ----------------------------------------------------
 
@@ -1234,6 +1261,7 @@ class MainWindow(QMainWindow):
             self._refresh_subtitle_overlay()
         note = f" ({len(cues)} cues)" if cues else " (no cues parsed — live preview unavailable)"
         self.status.showMessage(f"Subtitle imported: {p.name}{note}", 5000)
+        self._update_controls_enabled()
 
     def _on_asset_activated(self, asset_id: str) -> None:
         asset = self._assets.get(asset_id)
@@ -1264,6 +1292,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.status.showMessage("Subtitle burn-in disabled.", 3000)
+        self._update_controls_enabled()
 
     def _on_sub_activated(self, sub_id: str) -> None:
         self._activate_sub(sub_id)
@@ -1280,6 +1309,7 @@ class MainWindow(QMainWindow):
             self.clip_bin.set_active_sub(self._subs[0].id)
         self._refresh_subtitle_overlay()
         self.status.showMessage(f"Subtitle removed: {sub.path.name}", 3000)
+        self._update_controls_enabled()
 
     def _refresh_subtitle_overlay(self) -> None:
         """Recompute and paint the live subtitle overlay from the active
@@ -2785,12 +2815,16 @@ class MainWindow(QMainWindow):
         "AAC (audio only)",
     ]
 
-    def _populate_format_combo(self, audio_only: bool) -> None:
+    def _populate_format_combo(self, mode: str) -> None:
         previous_signal_state = self.format_combo.blockSignals(True)
         try:
             self.format_combo.clear()
 
-            if audio_only:
+            if mode == "subtitles":
+                for key in SUBTITLE_LANG_FORMATS:
+                    self.format_combo.addItem(key)
+                self.format_combo.setCurrentText("English (.srt)")
+            elif mode == "audio":
                 for key in self._AUDIO_FORMAT_ORDER:
                     if key in ff.EXPORT_FORMATS:
                         self.format_combo.addItem(key)
@@ -2803,18 +2837,57 @@ class MainWindow(QMainWindow):
         finally:
             self.format_combo.blockSignals(previous_signal_state)
 
+    def _export_mode(self) -> str:
+        text = self.export_type_combo.currentText()
+        if text == "Audio Only":
+            return "audio"
+        if text == "Subtitles":
+            return "subtitles"
+        return "project"
+
     def _on_export_type_changed(self, _text: str = "") -> None:
-        self._populate_format_combo(
-            self.export_type_combo.currentText() == "Audio Only"
-        )
+        self._populate_format_combo(self._export_mode())
         self._update_controls_enabled()
 
     def _is_audio_only_export(self) -> bool:
-        return self.export_type_combo.currentText() == "Audio Only"
+        return self._export_mode() == "audio"
+
+    def _pick_sub_for_export(self) -> SubtitleTrack | None:
+        """Prefer the active track; otherwise the first Sub with cues / any Sub."""
+        active = next((s for s in self._subs if s.active), None)
+        if active is not None:
+            return active
+        with_cues = next((s for s in self._subs if s.cues), None)
+        if with_cues is not None:
+            return with_cues
+        return self._subs[0] if self._subs else None
+
+    def _active_exportable_sub(self):
+        sub = self._pick_sub_for_export()
+        if sub is None:
+            return None
+        if sub.cues or sub.path.suffix.lower() in {".srt", ".vtt"}:
+            return sub
+        return None
 
     def _on_export_clicked(self) -> None:
+        if self._export_mode() == "subtitles":
+            self._export_subtitles_from_video()
+            return
+
         fmt_key = self.format_combo.currentText()
-        spec = ff.EXPORT_FORMATS[fmt_key]
+        spec = ff.EXPORT_FORMATS.get(fmt_key)
+        if spec is None:
+            # Combo still showing a stale SRT row — rebuild project/audio formats.
+            self._populate_format_combo(self._export_mode())
+            fmt_key = self.format_combo.currentText()
+            spec = ff.EXPORT_FORMATS.get(fmt_key)
+        if spec is None:
+            QMessageBox.warning(
+                self, "Export failed",
+                f"Unknown export format: {fmt_key!r}",
+            )
+            return
         is_audio_only = spec["vcodec"] is None
         if not self._clips and not (is_audio_only and self._added_audios):
             return
@@ -2883,6 +2956,70 @@ class MainWindow(QMainWindow):
         self._export_worker = worker
         self._update_controls_enabled()
         thread.start()
+
+    def _export_subtitles_from_video(self) -> None:
+        if not self._clips:
+            QMessageBox.information(
+                self,
+                "No video to transcribe",
+                "Add a video clip to the timeline first, then export Subtitles.",
+            )
+            return
+        lang_label = self.format_combo.currentText()
+        language = SUBTITLE_LANG_FORMATS.get(lang_label, "en")
+        stem = self._clips[0].path.with_suffix("").name
+        suggested = str(
+            self._clips[0].path.with_name(f"{stem}.{language}.srt")
+        )
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export subtitles from video…",
+            suggested,
+            "SubRip (*.srt);;All files (*)",
+        )
+        if not out_path:
+            return
+        path = Path(out_path)
+        if path.suffix.lower() != ".srt":
+            path = path.with_suffix(".srt")
+
+        self._last_progress = 0
+        self._last_eta = None
+        self.progress.setValue(0)
+        self.progress.setFormat("transcribing…")
+        self.export_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.export_log.clear()
+        self.export_log.append(
+            f"$ transcribe language={language} model=base → {path.name}"
+        )
+        self.status.showMessage("Generating subtitles from video…")
+
+        thread, worker = start_transcribe(self._clips, path, language)
+        worker.progress.connect(self._on_progress, Qt.QueuedConnection)
+        worker.status.connect(self._on_transcribe_status, Qt.QueuedConnection)
+        worker.finished.connect(self._on_transcribe_done, Qt.QueuedConnection)
+        worker.failed.connect(self._on_export_failed, Qt.QueuedConnection)
+        thread.finished.connect(self._reset_after_export)
+        self._export_thread = thread
+        self._export_worker = worker
+        self._update_controls_enabled()
+        thread.start()
+
+    def _on_transcribe_status(self, msg: str) -> None:
+        self.status.showMessage(msg, 8000)
+        self.export_log.append(msg)
+
+    def _on_transcribe_done(self, out: Path) -> None:
+        summary = f"Saved subtitles {out.name}"
+        self.status.showMessage(summary, 8000)
+        self.export_log.append(f"✓ {summary}")
+        self._last_progress = 100
+        self._last_eta = None
+        self.progress.setValue(100)
+        self.progress.setFormat("%p%")
+        # Drop into Subs so burn-in / preview can use it immediately.
+        self._import_sub(out)
 
     def _on_cancel_clicked(self) -> None:
         if self._export_worker:
@@ -2957,16 +3094,28 @@ class MainWindow(QMainWindow):
     def _update_controls_enabled(self) -> None:
         loaded = bool(self._clips)
         has_any = loaded or bool(self._added_audios)
+        mode = self._export_mode()
         self.play_btn.setEnabled(has_any)
         can_export = export_controls_enabled(
             has_clips=loaded,
             has_added_audio=bool(self._added_audios),
-            audio_only=self._is_audio_only_export(),
+            audio_only=mode == "audio",
             exporting=self._export_thread is not None,
+            subtitles_only=mode == "subtitles",
+            has_subtitles=self._active_exportable_sub() is not None,
         )
         self.crop_btn.setEnabled(loaded)
         self.format_combo.setEnabled(can_export)
         self.export_btn.setEnabled(can_export)
+        if mode == "subtitles":
+            self.export_btn.setToolTip(
+                "Generate an .srt from speech on the timeline "
+                "(English / Chinese / Vietnamese).",
+            )
+        elif can_export:
+            self.export_btn.setToolTip("Export")
+        else:
+            self.export_btn.setToolTip("Add a clip to the timeline to export")
         for w in (self.split_btn, self.delete_clip_btn):
             w.setEnabled(has_any)
         self.merge_btn.setEnabled(self._can_merge())

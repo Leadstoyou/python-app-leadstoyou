@@ -636,6 +636,27 @@ def _format_srt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def render_srt(sub: SubtitleTrack) -> str:
+    """Serialize ``sub.cues`` to SRT text, applying ``offset_ms``."""
+    offset = sub.offset_ms / 1000.0
+    blocks: list[str] = []
+    index = 1
+    for start, end, text in sub.cues:
+        s = start + offset
+        e = end + offset
+        if e <= 0:
+            continue
+        s = max(0.0, s)
+        body = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not body:
+            continue
+        blocks.append(
+            f"{index}\n{_format_srt_ts(s)} --> {_format_srt_ts(e)}\n{body}\n"
+        )
+        index += 1
+    return "\n".join(blocks)
+
+
 def _hex_to_libass(hex_color: str) -> str:
     h = hex_color.lstrip("#")
     if len(h) != 6:

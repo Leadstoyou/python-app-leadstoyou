@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QStandardPaths, QThread, Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QComboBox,
     QDialog,
@@ -26,6 +27,13 @@ from PySide6.QtWidgets import (
 
 _PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 _QUOTED_MP4_RE = re.compile(r'"([^"]+\.mp4)"')
+
+# (yt-dlp lang selector, checkbox label). Prefer official + auto captions.
+SUBTITLE_LANG_OPTIONS: list[tuple[str, str]] = [
+    ("zh.*", "中文 (Chinese)"),
+    ("en.*", "English"),
+    ("vi.*", "Tiếng Việt"),
+]
 
 
 def _quality_format(max_height: int | None = None) -> str:
@@ -81,7 +89,7 @@ def _yt_dlp_dirs() -> list[Path]:
 class DownloadWorker(QObject):
     progress = Signal(int)
     status = Signal(str)
-    finished = Signal(Path)
+    finished = Signal(Path, list)  # video path, related .srt paths
     failed = Signal(str)
     cancelled = Signal()
 
@@ -91,12 +99,14 @@ class DownloadWorker(QObject):
         quality: str,
         output_folder: Path,
         ffmpeg_path: str | None = None,
+        subtitle_langs: list[str] | None = None,
     ) -> None:
         super().__init__()
         self._url = url
         self._quality = quality
         self._output_folder = output_folder
         self._ffmpeg_path = ffmpeg_path
+        self._subtitle_langs = list(subtitle_langs or [])
         self._proc: subprocess.Popen[str] | None = None
         self._cancelled = False
 
@@ -123,6 +133,17 @@ class DownloadWorker(QObject):
             "-o", "%(title).200B [%(id)s].%(ext)s",
             "--print", "after_move:filepath",
         ]
+        if self._subtitle_langs:
+            cmd.extend(
+                [
+                    "--write-subs",
+                    "--write-auto-subs",
+                    "--sub-langs",
+                    ",".join(self._subtitle_langs),
+                    "--convert-subs",
+                    "srt",
+                ],
+            )
         if self._ffmpeg_path:
             cmd.extend(["--ffmpeg-location", self._ffmpeg_path])
         cmd.append(self._url)
@@ -182,9 +203,15 @@ class DownloadWorker(QObject):
             if out_path is None or not out_path.exists():
                 self.failed.emit("Download finished, but no MP4 file was found.")
                 return
+            srt_paths = self._related_srt_files(out_path) if self._subtitle_langs else []
             self.progress.emit(100)
-            self.status.emit(f"Downloaded {out_path.name}")
-            self.finished.emit(out_path)
+            if srt_paths:
+                self.status.emit(
+                    f"Downloaded {out_path.name} + {len(srt_paths)} SRT file(s)",
+                )
+            else:
+                self.status.emit(f"Downloaded {out_path.name}")
+            self.finished.emit(out_path, srt_paths)
         except FileNotFoundError:
             self.failed.emit(
                 "yt-dlp is required to download videos. Install yt-dlp and try again.",
@@ -224,6 +251,18 @@ class DownloadWorker(QObject):
         return max(mp4s, key=lambda p: p.stat().st_mtime)
 
     @staticmethod
+    def _related_srt_files(video: Path) -> list[Path]:
+        """SRT files yt-dlp wrote next to ``video`` (same stem / stem.lang)."""
+        stem = video.stem
+        parent = video.parent
+        found: list[Path] = []
+        for pattern in (f"{stem}.srt", f"{stem}.*.srt"):
+            found.extend(p for p in parent.glob(pattern) if p.is_file())
+        # Prefer unique paths, newest language variants first by name.
+        unique = sorted({p.resolve() for p in found}, key=lambda p: p.name.lower())
+        return unique
+
+    @staticmethod
     def _progress_percent(line: str) -> int | None:
         match = _PROGRESS_RE.search(line)
         if not match:
@@ -249,8 +288,11 @@ class DownloadWorker(QObject):
             or "postprocess" in lowered
             or "[movefiles]" in lowered
             or "deleting original file" in lowered
+            or "converting" in lowered
         ):
             return "Finalizing..."
+        if "subtitle" in lowered or "[info] writing" in lowered:
+            return "Downloading subtitles..."
         if line.startswith("[download]"):
             return "Downloading..."
         return None
@@ -281,13 +323,13 @@ class DownloadWorker(QObject):
 
 
 class DownloadVideoDialog(QDialog):
-    downloadFinished = Signal(Path)
+    downloadFinished = Signal(Path, list)  # video path, related .srt paths
 
     def __init__(self, parent=None, ffmpeg_path: str | None = None) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.setWindowTitle("Download Video")
         self.setModal(False)
-        self.resize(520, 260)
+        self.resize(520, 300)
         self._ffmpeg_path = ffmpeg_path
         self._thread: QThread | None = None
         self._worker: DownloadWorker | None = None
@@ -318,6 +360,20 @@ class DownloadVideoDialog(QDialog):
         folder_row.addWidget(self.folder_edit, stretch=1)
         folder_row.addWidget(self.folder_btn)
         form.addRow("Output folder", folder_row)
+
+        subs_row = QHBoxLayout()
+        self.sub_checkboxes: dict[str, QCheckBox] = {}
+        for lang_code, label in SUBTITLE_LANG_OPTIONS:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.setToolTip(
+                "Download official and auto-generated captions as .srt "
+                "(when the site provides them).",
+            )
+            self.sub_checkboxes[lang_code] = cb
+            subs_row.addWidget(cb)
+        subs_row.addStretch(1)
+        form.addRow("SRT subtitles", subs_row)
         root.addLayout(form)
 
         self.progress_bar = QProgressBar()
@@ -381,6 +437,8 @@ class DownloadVideoDialog(QDialog):
         self.url_edit.setEnabled(False)
         self.quality_combo.setEnabled(False)
         self.folder_btn.setEnabled(False)
+        for cb in self.sub_checkboxes.values():
+            cb.setEnabled(False)
 
         thread = QThread(self)
         worker = DownloadWorker(
@@ -388,6 +446,7 @@ class DownloadVideoDialog(QDialog):
             self.quality_combo.currentText(),
             output_folder,
             self._ffmpeg_path,
+            subtitle_langs=self._selected_subtitle_langs(),
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -405,13 +464,20 @@ class DownloadVideoDialog(QDialog):
         self._worker = worker
         thread.start()
 
+    def _selected_subtitle_langs(self) -> list[str]:
+        return [
+            code
+            for code, cb in self.sub_checkboxes.items()
+            if cb.isChecked()
+        ]
+
     def _cancel_download(self) -> None:
         if self._worker is not None:
             self.status_label.setText("Cancelling...")
             self._worker.cancel()
 
-    def _download_finished(self, path: Path) -> None:
-        self.downloadFinished.emit(path)
+    def _download_finished(self, path: Path, srt_paths: list) -> None:
+        self.downloadFinished.emit(path, list(srt_paths or []))
         self.accept()
 
     def _download_failed(self, message: str) -> None:
@@ -433,3 +499,5 @@ class DownloadVideoDialog(QDialog):
         self.url_edit.setEnabled(True)
         self.quality_combo.setEnabled(True)
         self.folder_btn.setEnabled(True)
+        for cb in self.sub_checkboxes.values():
+            cb.setEnabled(True)

@@ -48,6 +48,23 @@ class TestExportControlsEnabled(unittest.TestCase):
             audio_only=True, exporting=True,
         ))
 
+    def test_subtitles_mode_needs_clips(self):
+        self.assertTrue(export_controls_enabled(
+            has_clips=True, has_added_audio=False,
+            audio_only=False, exporting=False,
+            subtitles_only=True,
+        ))
+        self.assertFalse(export_controls_enabled(
+            has_clips=False, has_added_audio=False,
+            audio_only=False, exporting=False,
+            subtitles_only=True,
+        ))
+        self.assertFalse(export_controls_enabled(
+            has_clips=True, has_added_audio=False,
+            audio_only=False, exporting=True,
+            subtitles_only=True,
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
