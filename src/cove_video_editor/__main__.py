@@ -36,6 +36,45 @@ else:
 # everything we need — opt into it before QApplication touches the plugins.
 os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
 
+
+def _model_cache_dir() -> str:
+    """Where faster-whisper and Argos Translate should cache downloaded
+    models. Both default to the user's home directory (``~/.cache`` /
+    ``~/.local/share``), which on Windows is almost always the C: drive
+    regardless of where the app itself lives. Keep model downloads next to
+    the app instead — same drive as a source checkout, or next to the exe /
+    portable data dir for a built release — so a few GB of speech/translation
+    models don't quietly land on a drive the user didn't choose.
+    """
+    from .portable import is_portable, portable_data_dir
+
+    if getattr(sys, "frozen", False):
+        if is_portable():
+            base = portable_data_dir("cove-video-editor")
+        elif sys.platform == "win32":
+            base = os.path.join(
+                os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                "CoveVideoEditor",
+            )
+        else:
+            base = os.path.join(os.path.expanduser("~"), ".cove-video-editor")
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))
+        base = os.path.join(base, "assets")
+    return os.path.join(base, "models")
+
+
+_models_dir = _model_cache_dir()
+os.makedirs(_models_dir, exist_ok=True)
+# faster-whisper downloads its speech models via huggingface_hub.
+os.environ.setdefault("HF_HOME", os.path.join(_models_dir, "huggingface"))
+# Argos Translate's own package (model) store.
+os.environ.setdefault(
+    "ARGOS_PACKAGES_DIR", os.path.join(_models_dir, "argos-translate", "packages")
+)
+
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from . import theme  # noqa: E402

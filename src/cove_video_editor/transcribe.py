@@ -26,6 +26,15 @@ SUBTITLE_LANG_FORMATS: dict[str, str] = {
     "Tiếng Việt (.srt)": "vi",
 }
 
+# "Translate to" combo label → Argos Translate target language code.
+# ``None`` means keep the transcript in the spoken (source) language.
+TRANSLATE_LANG_FORMATS: dict[str, str | None] = {
+    "None (keep original)": None,
+    "English": "en",
+    "中文 Chinese": "zh",
+    "Tiếng Việt": "vi",
+}
+
 _MODEL_NAME = "base"
 
 
@@ -133,6 +142,131 @@ def transcribe_wav(wav_path: Path, language: str) -> list[tuple[float, float, st
     return cues
 
 
+def _argos_ensure_package(
+    from_code: str, to_code: str, status_cb=None,  # noqa: ANN001
+) -> None:
+    """Download + install the Argos Translate model for one language pair.
+
+    A no-op once installed. Needs internet the first time a given pair is
+    used; the model is cached locally afterward (fully offline from then on).
+    """
+    import argostranslate.package as apackage
+
+    installed = apackage.get_installed_packages()
+    if any(p.from_code == from_code and p.to_code == to_code for p in installed):
+        return
+
+    if status_cb:
+        status_cb(
+            f"Downloading translation model {from_code}→{to_code} "
+            "(first time only)…"
+        )
+    apackage.update_package_index()
+    available = apackage.get_available_packages()
+    match = next(
+        (p for p in available if p.from_code == from_code and p.to_code == to_code),
+        None,
+    )
+    if match is None:
+        raise RuntimeError(
+            f"No Argos Translate model available for {from_code} → {to_code}."
+        )
+    apackage.install_from_path(match.download())
+
+
+def _argos_get_translation(from_code: str, to_code: str, status_cb=None):  # noqa: ANN001
+    """Return a ready-to-use ``ITranslation`` for ``from_code`` → ``to_code``.
+
+    Installs the direct model if available; otherwise pivots through English
+    (installing both legs), since Argos's package index doesn't cover every
+    pair directly (e.g. zh → vi).
+    """
+    import argostranslate.translate as atranslate
+
+    def _lang(code: str):
+        lang = next(
+            (l for l in atranslate.get_installed_languages() if l.code == code), None
+        )
+        if lang is None:
+            raise RuntimeError(f"Argos Translate has no installed language '{code}'.")
+        return lang
+
+    if from_code == to_code:
+        raise RuntimeError("Source and target languages are the same.")
+
+    direct_error: RuntimeError | None = None
+    try:
+        _argos_ensure_package(from_code, to_code, status_cb)
+        direct = _lang(from_code).get_translation(_lang(to_code))
+        if direct is not None:
+            return direct
+    except RuntimeError as exc:
+        direct_error = exc
+
+    if "en" in (from_code, to_code):
+        raise direct_error or RuntimeError(
+            f"No Argos Translate model for {from_code} → {to_code}."
+        )
+    _argos_ensure_package(from_code, "en", status_cb)
+    _argos_ensure_package("en", to_code, status_cb)
+    first = _lang(from_code).get_translation(_lang("en"))
+    second = _lang("en").get_translation(_lang(to_code))
+    if first is None or second is None:
+        raise RuntimeError(
+            f"Could not build a translation path {from_code} → en → {to_code}."
+        )
+
+    class _Pivoted:
+        def translate(self, text: str) -> str:
+            return second.translate(first.translate(text))
+
+    return _Pivoted()
+
+
+def translate_cues(
+    cues: list[tuple[float, float, str]],
+    from_lang: str,
+    target_lang: str,
+    status_cb=None,  # noqa: ANN001
+    progress_cb=None,  # noqa: ANN001
+) -> list[tuple[float, float, str]]:
+    """Translate cue text from ``from_lang`` to ``target_lang``, offline, via
+    Argos Translate. Keeps original timing.
+
+    ``status_cb(msg)`` reports coarse phase changes (model download vs.
+    translating); ``progress_cb(done, total)`` reports per-cue progress —
+    both matter here because a first-time model download plus per-line CPU
+    inference can take long enough that a static "70%" reads as a hang.
+    """
+    try:
+        import argostranslate.translate  # noqa: F401
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "argostranslate is not installed. Run:\n"
+            "  pip install argostranslate"
+        ) from exc
+
+    try:
+        translation = _argos_get_translation(from_lang, target_lang, status_cb)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Translation setup failed: {exc}") from exc
+
+    if status_cb:
+        status_cb("Translating…")
+
+    total = len(cues)
+    out: list[tuple[float, float, str]] = []
+    for i, (start, end, text) in enumerate(cues):
+        try:
+            new_text = translation.translate(text).strip()
+        except Exception:  # noqa: BLE001
+            new_text = text
+        out.append((start, end, new_text or text))
+        if progress_cb:
+            progress_cb(i + 1, total)
+    return out
+
+
 class TranscribeWorker(QObject):
     progress = Signal(int)
     status = Signal(str)
@@ -144,11 +278,13 @@ class TranscribeWorker(QObject):
         clips: list[Clip],
         output: Path,
         language: str,
+        translate_to: str | None = None,
     ) -> None:
         super().__init__()
         self._clips = [c.clone() for c in clips]
         self._output = output
         self._language = language
+        self._translate_to = translate_to
         self._cancelled = False
 
     @Slot()
@@ -185,6 +321,19 @@ class TranscribeWorker(QObject):
                 )
                 return
 
+            if self._translate_to and self._translate_to != self._language:
+                if self._cancelled:
+                    return
+                self.status.emit(f"Translating to {self._translate_to}…")
+                self.progress.emit(70)
+                cues = translate_cues(
+                    cues, self._language, self._translate_to,
+                    status_cb=self.status.emit,
+                    progress_cb=lambda done, total: self.progress.emit(
+                        70 + int(20 * done / total) if total else 90
+                    ),
+                )
+
             self.progress.emit(90)
             self.status.emit("Writing SRT…")
             self._output.parent.mkdir(parents=True, exist_ok=True)
@@ -209,9 +358,10 @@ def start_transcribe(
     clips: list[Clip],
     output: Path,
     language: str,
+    translate_to: str | None = None,
 ) -> tuple[QThread, TranscribeWorker]:
     thread = QThread()
-    worker = TranscribeWorker(clips, output, language)
+    worker = TranscribeWorker(clips, output, language, translate_to)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)

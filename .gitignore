@@ -5,6 +5,8 @@ __pycache__/
 .buildenv/
 build/
 dist/
+assets/bin/
+assets/models/
 release/
 *.spec
 .DS_Store

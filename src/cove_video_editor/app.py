@@ -102,7 +102,7 @@ from .clip_bin import ASSET_MIME, ClipBin
 from .crop_overlay import CropOverlay
 from .downloader import DownloadVideoDialog
 from .exporter import AudioTrack, ExportJob, start_export
-from .transcribe import SUBTITLE_LANG_FORMATS, start_transcribe
+from .transcribe import SUBTITLE_LANG_FORMATS, TRANSLATE_LANG_FORMATS, start_transcribe
 from .thumbnails import start_thumbnails, start_waveform
 from .timeline_widget import TimelineWidget
 
@@ -995,6 +995,16 @@ class MainWindow(QMainWindow):
 
         self.format_combo = QComboBox()
         self.format_combo.setMinimumWidth(220)
+
+        self.translate_lbl = QLabel("TRANSLATE TO")
+        self.translate_lbl.setObjectName("ExportLabel")
+        self.translate_combo = QComboBox()
+        self.translate_combo.setMinimumWidth(160)
+        for key in TRANSLATE_LANG_FORMATS:
+            self.translate_combo.addItem(key)
+        self.translate_lbl.setVisible(False)
+        self.translate_combo.setVisible(False)
+
         self._populate_format_combo("project")
 
         export_lbl = QLabel("EXPORT")
@@ -1005,6 +1015,8 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.export_type_combo, stretch=0)
         bottom.addWidget(as_lbl)
         bottom.addWidget(self.format_combo, stretch=0)
+        bottom.addWidget(self.translate_lbl)
+        bottom.addWidget(self.translate_combo, stretch=0)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -2816,6 +2828,8 @@ class MainWindow(QMainWindow):
     ]
 
     def _populate_format_combo(self, mode: str) -> None:
+        self.translate_lbl.setVisible(mode == "subtitles")
+        self.translate_combo.setVisible(mode == "subtitles")
         previous_signal_state = self.format_combo.blockSignals(True)
         try:
             self.format_combo.clear()
@@ -2824,6 +2838,7 @@ class MainWindow(QMainWindow):
                 for key in SUBTITLE_LANG_FORMATS:
                     self.format_combo.addItem(key)
                 self.format_combo.setCurrentText("English (.srt)")
+                self.translate_combo.setCurrentText("None (keep original)")
             elif mode == "audio":
                 for key in self._AUDIO_FORMAT_ORDER:
                     if key in ff.EXPORT_FORMATS:
@@ -2967,9 +2982,12 @@ class MainWindow(QMainWindow):
             return
         lang_label = self.format_combo.currentText()
         language = SUBTITLE_LANG_FORMATS.get(lang_label, "en")
+        translate_label = self.translate_combo.currentText()
+        translate_to = TRANSLATE_LANG_FORMATS.get(translate_label)
         stem = self._clips[0].path.with_suffix("").name
+        suffix = translate_to or language
         suggested = str(
-            self._clips[0].path.with_name(f"{stem}.{language}.srt")
+            self._clips[0].path.with_name(f"{stem}.{suffix}.srt")
         )
         out_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -2991,11 +3009,12 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(True)
         self.export_log.clear()
         self.export_log.append(
-            f"$ transcribe language={language} model=base → {path.name}"
+            f"$ transcribe language={language} translate_to={translate_to} "
+            f"model=base → {path.name}"
         )
         self.status.showMessage("Generating subtitles from video…")
 
-        thread, worker = start_transcribe(self._clips, path, language)
+        thread, worker = start_transcribe(self._clips, path, language, translate_to)
         worker.progress.connect(self._on_progress, Qt.QueuedConnection)
         worker.status.connect(self._on_transcribe_status, Qt.QueuedConnection)
         worker.finished.connect(self._on_transcribe_done, Qt.QueuedConnection)
@@ -3106,6 +3125,7 @@ class MainWindow(QMainWindow):
         )
         self.crop_btn.setEnabled(loaded)
         self.format_combo.setEnabled(can_export)
+        self.translate_combo.setEnabled(can_export)
         self.export_btn.setEnabled(can_export)
         if mode == "subtitles":
             self.export_btn.setToolTip(
@@ -3205,41 +3225,8 @@ class MainWindow(QMainWindow):
         if self._update_prompt_shown:
             return
         self._update_prompt_shown = True
-        self._prompt_update(info)
 
-    def _prompt_update(self, info) -> None:
-        kind = updater.bundle_kind()
-        can_auto_install = kind == "appimage" and bool(info.asset_url)
-
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Information)
-        msg.setWindowTitle("Cove Video Editor — update available")
-        msg.setText(
-            f"Cove Video Editor v{info.latest_version} is available.\n"
-            f"You're running v{__version__}.",
-        )
-        if can_auto_install:
-            msg.setInformativeText(
-                f"{info.asset_name} ({info.asset_size // (1024 * 1024)} MB). "
-                "The app will restart after the update.",
-            )
-            install_btn = msg.addButton("Update now", QMessageBox.AcceptRole)
-            open_btn = msg.addButton("View release", QMessageBox.HelpRole)
-            msg.addButton("Later", QMessageBox.RejectRole)
-        else:
-            msg.setInformativeText(
-                "Open the release page to download the latest installer.",
-            )
-            install_btn = None
-            open_btn = msg.addButton("View release", QMessageBox.AcceptRole)
-            msg.addButton("Later", QMessageBox.RejectRole)
-        msg.exec()
-        clicked = msg.clickedButton()
-        if install_btn is not None and clicked is install_btn:
-            self._install_update(info)
-        elif open_btn is not None and clicked is open_btn:
-            _open_url(info.release_url)
-
+    
     def _install_update(self, info) -> None:
         if not info.asset_url:
             _open_url(info.release_url)
