@@ -1,10 +1,16 @@
-"""Generate SRT subtitles from timeline video audio via faster-whisper."""
+"""Generate SRT subtitles from timeline video audio via faster-whisper
+(FunASR for Chinese, which transcribes and punctuates Mandarin far more
+reliably than Whisper)."""
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -19,6 +25,56 @@ if os.name == "nt":
 else:
     _POPEN_KWARGS = {}
 
+
+def _load_dotenv() -> None:
+    """Load ``KEY=VALUE`` lines from a project-root ``.env`` file into
+    ``os.environ``, without overwriting a variable that's already set (e.g.
+    via ``setx``). Lets a secret like ``GEMINI_API_KEY`` live in a local,
+    gitignored file instead of a real environment variable or source code.
+    """
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent.parent.parent / ".env",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                os.environ.setdefault(key, value)
+        return
+
+
+_load_dotenv()
+
+
+def _ensure_model_cache_env() -> None:
+    """Point faster-whisper/FunASR's downloaders at ``assets/models`` next
+    to the project checkout, matching ``__main__.py``'s ``_model_cache_dir``
+    — but via ``setdefault``, so it's a no-op whenever ``__main__.py`` (the
+    GUI app) already set these earlier at startup.
+
+    This only matters for code that imports this module *without* going
+    through ``__main__.py`` first — a standalone dev script (``scripts/*``).
+    Without it, ``huggingface_hub``/``modelscope`` fall back to caching in
+    the user's home directory (``~/.cache``, almost always the C: drive on
+    Windows regardless of where the project lives), and a script run this
+    way ends up downloading its own separate multi-GB copy of a model the
+    GUI app already cached under the project.
+    """
+    base = Path(__file__).resolve().parent.parent.parent / "assets" / "models"
+    os.environ.setdefault("HF_HOME", str(base / "huggingface"))
+    os.environ.setdefault("MODELSCOPE_CACHE", str(base / "modelscope"))
+
+
+_ensure_model_cache_env()
+
 # Format combo label → Whisper language code.
 SUBTITLE_LANG_FORMATS: dict[str, str] = {
     "English (.srt)": "en",
@@ -26,7 +82,8 @@ SUBTITLE_LANG_FORMATS: dict[str, str] = {
     "Tiếng Việt (.srt)": "vi",
 }
 
-# "Translate to" combo label → Argos Translate target language code.
+# "Translate to" combo label → language code. Translation goes through the
+# Gemini API (requires GEMINI_API_KEY) — see translate_cues().
 # ``None`` means keep the transcript in the spoken (source) language.
 TRANSLATE_LANG_FORMATS: dict[str, str | None] = {
     "None (keep original)": None,
@@ -36,6 +93,15 @@ TRANSLATE_LANG_FORMATS: dict[str, str | None] = {
 }
 
 _MODEL_NAME = "base"
+
+# FunASR (Paraformer) sentence-splitting tuning — see transcribe_wav_funasr().
+# Every clause-ending mark (sentence enders *and* commas) ends a cue, so
+# each spoken clause becomes its own subtitle card instead of several
+# clauses — each of which may become its own sentence once translated —
+# being crammed into one long-lived cue.
+_CJK_RE = re.compile(r"[一-鿿]")
+_LATIN_RUN_RE = re.compile(r"[A-Za-z0-9]+")
+_SENTENCE_END = set("。！？…，、；")
 
 
 def cues_to_srt(cues: list[tuple[float, float, str]]) -> str:
@@ -116,8 +182,122 @@ def extract_timeline_wav(clips: list[Clip], wav_path: Path) -> None:
     subprocess.run(cmd, check=True, **_POPEN_KWARGS)
 
 
+def _funasr_text_to_cues(
+    text: str, timestamps_ms: list[list[int]]
+) -> list[tuple[float, float, str]]:
+    """Split FunASR's globally-punctuated ``text`` into sentence cues.
+
+    FunASR's own per-chunk ``sentence_info`` splits at VAD segment
+    boundaries, which shifts a boundary character into the wrong chunk
+    whenever the recognizer's context window crosses a chunk edge.
+    Splitting the single global ``text`` string against the flat
+    per-token ``timestamp`` list avoids that: each CJK character consumes
+    one timestamp entry, and each run of consecutive ASCII letters/digits
+    (e.g. "Oppo", "max") consumes exactly one, since that's how the model
+    tokenized them. Every comma/clause-end mark closes a cue, so each
+    spoken clause is its own cue — important once translated, since one
+    Chinese clause commonly becomes one full sentence in the target
+    language.
+    """
+    cues: list[tuple[float, float, str]] = []
+    ts_index = 0
+    buf: list[str] = []
+    buf_start_ms: int | None = None
+    buf_end_ms: int | None = None
+
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        m = _LATIN_RUN_RE.match(text, i)
+        if m:
+            token = m.group()
+            i = m.end()
+        else:
+            token = ch
+            i += 1
+
+        if _CJK_RE.fullmatch(token) or _LATIN_RUN_RE.fullmatch(token):
+            if ts_index >= len(timestamps_ms):
+                start_ms, end_ms = buf_end_ms or 0, buf_end_ms or 0
+            else:
+                start_ms, end_ms = timestamps_ms[ts_index]
+                ts_index += 1
+            if buf_start_ms is None:
+                buf_start_ms = start_ms
+            buf_end_ms = end_ms
+            buf.append(token)
+        else:
+            buf.append(token)
+            if token in _SENTENCE_END:
+                sentence = "".join(buf).strip()
+                if sentence and buf_start_ms is not None:
+                    cues.append(
+                        (buf_start_ms / 1000.0, buf_end_ms / 1000.0, sentence)
+                    )
+                buf = []
+                buf_start_ms = None
+                buf_end_ms = None
+
+    tail = "".join(buf).strip()
+    if tail and buf_start_ms is not None:
+        cues.append((buf_start_ms / 1000.0, buf_end_ms / 1000.0, tail))
+    return cues
+
+
+_funasr_model = None
+
+
+def _get_funasr_model():
+    global _funasr_model
+    if _funasr_model is None:
+        try:
+            from funasr import AutoModel
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "funasr is not installed. Run:\n"
+                "  pip install funasr kaldi-native-fbank"
+            ) from exc
+        _funasr_model = AutoModel(
+            model="paraformer-zh",
+            vad_model="fsmn-vad",
+            punc_model="ct-punc",
+            device="cpu",
+            disable_update=True,
+        )
+    return _funasr_model
+
+
+def transcribe_wav_funasr(wav_path: Path) -> list[tuple[float, float, str]]:
+    """Run FunASR (Paraformer + VAD + punctuation) for Mandarin Chinese.
+
+    Whisper frequently garbles Mandarin and never restores punctuation,
+    since Chinese text has no spaces to hint at word/sentence boundaries.
+    FunASR's Paraformer + ct-punc pipeline is purpose-built for Mandarin
+    and produces properly punctuated, far more accurate transcripts.
+    """
+    model = _get_funasr_model()
+    result = model.generate(input=str(wav_path), batch_size_s=300)
+
+    cues: list[tuple[float, float, str]] = []
+    for item in result:
+        text = (item.get("text") or "").strip()
+        timestamps_ms = item.get("timestamp") or []
+        if not text:
+            continue
+        cues.extend(_funasr_text_to_cues(text, timestamps_ms))
+    return cues
+
+
 def transcribe_wav(wav_path: Path, language: str) -> list[tuple[float, float, str]]:
-    """Run faster-whisper and return ``(start, end, text)`` cues."""
+    """Return ``(start, end, text)`` cues for ``wav_path``.
+
+    Chinese goes through FunASR (see ``transcribe_wav_funasr``); every
+    other language goes through faster-whisper.
+    """
+    if language == "zh":
+        return transcribe_wav_funasr(wav_path)
+
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:  # pragma: no cover
@@ -142,85 +322,146 @@ def transcribe_wav(wav_path: Path, language: str) -> list[tuple[float, float, st
     return cues
 
 
-def _argos_ensure_package(
-    from_code: str, to_code: str, status_cb=None,  # noqa: ANN001
-) -> None:
-    """Download + install the Argos Translate model for one language pair.
+_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+_GEMINI_LANG_NAMES: dict[str, str] = {
+    "en": "English",
+    "zh": "Chinese",
+    "vi": "Vietnamese",
+}
 
-    A no-op once installed. Needs internet the first time a given pair is
-    used; the model is cached locally afterward (fully offline from then on).
+# Cues per Gemini request. Kept well under what the model's context window
+# could take: past a few hundred numbered lines in one prompt, Gemini gets
+# noticeably more likely to merge/drop a line, throwing off the 1:1 mapping
+# back to cue timings (checked below via the returned-count assertion). Most
+# single-clip transcripts run under this, so they cost exactly one request;
+# only unusually long ones split into more.
+_GEMINI_BATCH_SIZE = 200
+# HTTP codes worth retrying: rate-limited or a transient server-side hiccup,
+# as opposed to e.g. 400 (bad request) or 403 (bad API key), which won't
+# succeed no matter how many times they're retried.
+_GEMINI_RETRYABLE_CODES = {429, 500, 502, 503, 504}
+
+
+class _GeminiTransientError(RuntimeError):
+    """A Gemini call failed in a way that's worth retrying (rate limit or
+    transient server error), as opposed to a permanent failure like a bad
+    API key or malformed request.
     """
-    import argostranslate.package as apackage
 
-    installed = apackage.get_installed_packages()
-    if any(p.from_code == from_code and p.to_code == to_code for p in installed):
-        return
 
-    if status_cb:
-        status_cb(
-            f"Downloading translation model {from_code}→{to_code} "
-            "(first time only)…"
-        )
-    apackage.update_package_index()
-    available = apackage.get_available_packages()
-    match = next(
-        (p for p in available if p.from_code == from_code and p.to_code == to_code),
-        None,
+def _gemini_translate_batch(
+    texts: list[str], from_lang: str, target_lang: str, api_key: str
+) -> list[str]:
+    from_name = _GEMINI_LANG_NAMES.get(from_lang, from_lang)
+    to_name = _GEMINI_LANG_NAMES.get(target_lang, target_lang)
+    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    prompt = (
+        f"You are translating video subtitles from {from_name} to {to_name}. "
+        f"Translate each numbered line below into natural, colloquial "
+        f"{to_name} suitable for on-screen subtitles, preserving the tone, "
+        f"slang, and meaning of casual spoken {from_name} rather than "
+        "translating word-for-word. Return exactly "
+        f"{len(texts)} translations, in the same order, as a JSON array of "
+        "strings — one string per input line, with no numbering and no "
+        "extra commentary.\n\n" + numbered
     )
-    if match is None:
-        raise RuntimeError(
-            f"No Argos Translate model available for {from_code} → {to_code}."
-        )
-    apackage.install_from_path(match.download())
-
-
-def _argos_get_translation(from_code: str, to_code: str, status_cb=None):  # noqa: ANN001
-    """Return a ready-to-use ``ITranslation`` for ``from_code`` → ``to_code``.
-
-    Installs the direct model if available; otherwise pivots through English
-    (installing both legs), since Argos's package index doesn't cover every
-    pair directly (e.g. zh → vi).
-    """
-    import argostranslate.translate as atranslate
-
-    def _lang(code: str):
-        lang = next(
-            (l for l in atranslate.get_installed_languages() if l.code == code), None
-        )
-        if lang is None:
-            raise RuntimeError(f"Argos Translate has no installed language '{code}'.")
-        return lang
-
-    if from_code == to_code:
-        raise RuntimeError("Source and target languages are the same.")
-
-    direct_error: RuntimeError | None = None
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {"type": "ARRAY", "items": {"type": "STRING"}},
+        },
+    }).encode("utf-8")
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{_GEMINI_MODEL}:generateContent"
+    )
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+    )
     try:
-        _argos_ensure_package(from_code, to_code, status_cb)
-        direct = _lang(from_code).get_translation(_lang(to_code))
-        if direct is not None:
-            return direct
-    except RuntimeError as exc:
-        direct_error = exc
-
-    if "en" in (from_code, to_code):
-        raise direct_error or RuntimeError(
-            f"No Argos Translate model for {from_code} → {to_code}."
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        error_cls = (
+            _GeminiTransientError if exc.code in _GEMINI_RETRYABLE_CODES
+            else RuntimeError
         )
-    _argos_ensure_package(from_code, "en", status_cb)
-    _argos_ensure_package("en", to_code, status_cb)
-    first = _lang(from_code).get_translation(_lang("en"))
-    second = _lang("en").get_translation(_lang(to_code))
-    if first is None or second is None:
+        raise error_cls(f"Gemini API error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise _GeminiTransientError(
+            f"Could not reach Gemini API: {exc.reason}"
+        ) from exc
+
+    try:
+        text_out = payload["candidates"][0]["content"]["parts"][0]["text"]
+        translations = json.loads(text_out)
+    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Unexpected Gemini response: {payload}") from exc
+    if len(translations) != len(texts):
         raise RuntimeError(
-            f"Could not build a translation path {from_code} → en → {to_code}."
+            f"Gemini returned {len(translations)} line(s), expected {len(texts)}."
         )
+    return translations
 
-    class _Pivoted:
-        def translate(self, text: str) -> str:
-            return second.translate(first.translate(text))
 
-    return _Pivoted()
+def _translate_cues_gemini(
+    cues: list[tuple[float, float, str]],
+    from_lang: str,
+    target_lang: str,
+    api_key: str,
+    status_cb=None,  # noqa: ANN001
+    progress_cb=None,  # noqa: ANN001
+) -> list[tuple[float, float, str]]:
+    """Translate cue text via the Gemini API — an actual LLM, so it handles
+    casual/slangy speech and specific terminology far better than a plain
+    NMT model. Requires ``api_key`` and an internet connection; cues are
+    sent in batches so the model sees enough surrounding context to
+    translate consistently.
+
+    A batch that fails with a rate limit or a transient server error (5xx)
+    is retried with backoff — Gemini's API is flaky enough under load that
+    a single hiccup on, say, batch 2 of 3 would otherwise abort the whole
+    transcript partway through.
+    """
+    import time
+
+    total = len(cues)
+    out: list[tuple[float, float, str]] = []
+    for start_idx in range(0, total, _GEMINI_BATCH_SIZE):
+        batch = cues[start_idx : start_idx + _GEMINI_BATCH_SIZE]
+        if status_cb:
+            status_cb(
+                f"Translating via Gemini… ({start_idx + len(batch)}/{total})"
+            )
+        texts = [c[2] for c in batch]
+        delay = 2.0
+        for attempt in range(5):
+            try:
+                translations = _gemini_translate_batch(
+                    texts, from_lang, target_lang, api_key
+                )
+                break
+            except _GeminiTransientError:
+                if attempt == 4:
+                    raise
+                if status_cb:
+                    status_cb(
+                        "Gemini is busy/rate-limited, retrying "
+                        f"({attempt + 1}/5)…"
+                    )
+                time.sleep(delay)
+                delay *= 2
+        for (start, end, original), new_text in zip(batch, translations):
+            new_text = (new_text or "").strip()
+            out.append((start, end, new_text or original))
+        if progress_cb:
+            progress_cb(min(start_idx + _GEMINI_BATCH_SIZE, total), total)
+    return out
 
 
 def translate_cues(
@@ -230,41 +471,20 @@ def translate_cues(
     status_cb=None,  # noqa: ANN001
     progress_cb=None,  # noqa: ANN001
 ) -> list[tuple[float, float, str]]:
-    """Translate cue text from ``from_lang`` to ``target_lang``, offline, via
-    Argos Translate. Keeps original timing.
-
-    ``status_cb(msg)`` reports coarse phase changes (model download vs.
-    translating); ``progress_cb(done, total)`` reports per-cue progress —
-    both matter here because a first-time model download plus per-line CPU
-    inference can take long enough that a static "70%" reads as a hang.
+    """Translate cue text from ``from_lang`` to ``target_lang`` via the
+    Gemini API, keeping original timing. Requires a ``GEMINI_API_KEY``
+    environment variable (or ``.env`` entry) and an internet connection.
     """
-    try:
-        import argostranslate.translate  # noqa: F401
-    except ImportError as exc:  # pragma: no cover
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
         raise RuntimeError(
-            "argostranslate is not installed. Run:\n"
-            "  pip install argostranslate"
-        ) from exc
-
-    try:
-        translation = _argos_get_translation(from_lang, target_lang, status_cb)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Translation setup failed: {exc}") from exc
-
-    if status_cb:
-        status_cb("Translating…")
-
-    total = len(cues)
-    out: list[tuple[float, float, str]] = []
-    for i, (start, end, text) in enumerate(cues):
-        try:
-            new_text = translation.translate(text).strip()
-        except Exception:  # noqa: BLE001
-            new_text = text
-        out.append((start, end, new_text or text))
-        if progress_cb:
-            progress_cb(i + 1, total)
-    return out
+            "GEMINI_API_KEY is not set. Add it to a .env file in the "
+            "project root, or set it as an environment variable."
+        )
+    return _translate_cues_gemini(
+        cues, from_lang, target_lang, api_key,
+        status_cb=status_cb, progress_cb=progress_cb,
+    )
 
 
 class TranscribeWorker(QObject):
@@ -307,9 +527,15 @@ class TranscribeWorker(QObject):
             if self._cancelled:
                 return
 
-            self.status.emit(
-                "Transcribing… (first run downloads the speech model)"
-            )
+            if self._language == "zh":
+                self.status.emit(
+                    "Transcribing… (first run downloads the FunASR "
+                    "Chinese speech + punctuation models, ~2 GB)"
+                )
+            else:
+                self.status.emit(
+                    "Transcribing… (first run downloads the speech model)"
+                )
             self.progress.emit(20)
             cues = transcribe_wav(wav_path, self._language)
             if self._cancelled:

@@ -38,13 +38,13 @@ os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
 
 
 def _model_cache_dir() -> str:
-    """Where faster-whisper and Argos Translate should cache downloaded
-    models. Both default to the user's home directory (``~/.cache`` /
-    ``~/.local/share``), which on Windows is almost always the C: drive
-    regardless of where the app itself lives. Keep model downloads next to
-    the app instead — same drive as a source checkout, or next to the exe /
-    portable data dir for a built release — so a few GB of speech/translation
-    models don't quietly land on a drive the user didn't choose.
+    """Where faster-whisper and FunASR/ModelScope should cache downloads.
+    All default to the user's home directory (``~/.cache``), which on
+    Windows is almost always the C: drive regardless of where the app
+    itself lives. Keep model downloads next to the app instead — same
+    drive as a source checkout, or next to the exe / portable data dir for
+    a built release — so several GB of speech models don't quietly land on
+    a drive the user didn't choose.
     """
     from .portable import is_portable, portable_data_dir
 
@@ -68,12 +68,10 @@ def _model_cache_dir() -> str:
 
 _models_dir = _model_cache_dir()
 os.makedirs(_models_dir, exist_ok=True)
-# faster-whisper downloads its speech models via huggingface_hub.
+# faster-whisper downloads its model via huggingface_hub.
 os.environ.setdefault("HF_HOME", os.path.join(_models_dir, "huggingface"))
-# Argos Translate's own package (model) store.
-os.environ.setdefault(
-    "ARGOS_PACKAGES_DIR", os.path.join(_models_dir, "argos-translate", "packages")
-)
+# FunASR (Chinese speech-to-text) downloads its models via ModelScope.
+os.environ.setdefault("MODELSCOPE_CACHE", os.path.join(_models_dir, "modelscope"))
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
