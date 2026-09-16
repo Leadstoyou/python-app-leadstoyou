@@ -3,3 +3,4 @@ yt-dlp>=2024.8.0
 faster-whisper>=1.0.0
 funasr>=1.4.0
 kaldi-native-fbank>=1.20
+stable-ts>=2.19.0

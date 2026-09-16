@@ -103,6 +103,19 @@ _CJK_RE = re.compile(r"[一-鿿]")
 _LATIN_RUN_RE = re.compile(r"[A-Za-z0-9]+")
 _SENTENCE_END = set("。！？…，、；")
 
+# faster-whisper word-splitting tuning — see _whisper_words_to_cues(). Whisper's
+# own segments span whatever the VAD chunked together, which is often several
+# spoken clauses *with a silent pause between them* crammed into one cue with
+# a start/end that stretches across the pause. Rebuilding cues from
+# word-level timestamps instead — cutting a new cue at a clause-ending mark
+# *or* whenever the gap to the next word is long enough to be an actual
+# pause — keeps each cue to one continuous run of speech and its timing
+# tight around it, mirroring what _funasr_text_to_cues() already does for
+# Chinese.
+_LATIN_CLAUSE_END = set(".!?,;:…")
+_WHISPER_PAUSE_GAP_S = 0.5
+_WHISPER_MAX_CUE_DURATION_S = 7.0
+
 
 def cues_to_srt(cues: list[tuple[float, float, str]]) -> str:
     blocks: list[str] = []
@@ -289,6 +302,51 @@ def transcribe_wav_funasr(wav_path: Path) -> list[tuple[float, float, str]]:
     return cues
 
 
+def _whisper_words_to_cues(
+    segments,  # noqa: ANN001 — Iterable[faster_whisper.transcribe.Segment]
+    pause_gap_s: float = _WHISPER_PAUSE_GAP_S,
+    max_cue_duration_s: float = _WHISPER_MAX_CUE_DURATION_S,
+) -> list[tuple[float, float, str]]:
+    """Rebuild cues from Whisper's per-word timestamps.
+
+    A new cue starts whenever the silent gap since the previous word is at
+    least ``pause_gap_s`` (a real spoken pause, not just VAD noise), and the
+    current cue is closed as soon as a word ends in clause-ending
+    punctuation or the cue has been running for ``max_cue_duration_s`` —
+    whichever comes first — so a long unpunctuated run of speech still gets
+    split into shorter cues.
+    """
+    cues: list[tuple[float, float, str]] = []
+    buf: list[str] = []
+    buf_start: float | None = None
+    buf_end: float | None = None
+
+    def flush() -> None:
+        nonlocal buf, buf_start, buf_end
+        text = "".join(buf).strip()
+        if text and buf_start is not None and buf_end is not None:
+            cues.append((buf_start, buf_end, text))
+        buf = []
+        buf_start = None
+        buf_end = None
+
+    for seg in segments:
+        for w in seg.words or []:
+            start, end = float(w.start), float(w.end)
+            if buf_end is not None and (start - buf_end) >= pause_gap_s:
+                flush()
+            if buf_start is None:
+                buf_start = start
+            buf_end = end
+            buf.append(w.word)
+            stripped = w.word.strip()
+            ends_clause = bool(stripped) and stripped[-1] in _LATIN_CLAUSE_END
+            if ends_clause or (buf_end - buf_start) >= max_cue_duration_s:
+                flush()
+    flush()
+    return cues
+
+
 def transcribe_wav(wav_path: Path, language: str) -> list[tuple[float, float, str]]:
     """Return ``(start, end, text)`` cues for ``wav_path``.
 
@@ -312,14 +370,9 @@ def transcribe_wav(wav_path: Path, language: str) -> list[tuple[float, float, st
         language=language,
         vad_filter=True,
         beam_size=5,
+        word_timestamps=True,
     )
-    cues: list[tuple[float, float, str]] = []
-    for seg in segments:
-        text = (seg.text or "").strip()
-        if not text:
-            continue
-        cues.append((float(seg.start), float(seg.end), text))
-    return cues
+    return _whisper_words_to_cues(segments)
 
 
 _GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
